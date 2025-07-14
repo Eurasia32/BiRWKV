@@ -9,87 +9,91 @@ T* get_ptr(torch::Tensor& t) {
 }
 
 // CUDA kernel for the forward pass of Bi-WKV
-template<typename T>
+template<typename T_in>
 __global__ void bi_wkv_forward_kernel(
-    const T* r, const T* k, const T* v, const float* w, const float* u,
-    T* y,
+    const T_in* r, const T_in* k, const T_in* v, const float* w, const float* u,
+    T_in* y,
     // Workspace to store intermediate states for the backward pass
     float* num_fwd, float* den_fwd, float* num_bwd, float* den_bwd,
-    const int B, const int T, const int C)
+    const int B, const int seq_len, const int C)
 {
     const int b = blockIdx.x;
     const int c = threadIdx.x + blockIdx.y * blockDim.x;
     if (c >= C) return;
 
-    const int offset = b * T * C + c;
+    const int offset = b * seq_len * C + c;
     
     // Time decay factor. w is learnable, so we use -exp(w) to keep it negative.
     const float decay = expf(-expf(w[c]));
 
     // Forward RNN (left-to-right)
-    float a = 0.0f; // numerator state
-    float b = 0.0f; // denominator state
-    for (int t = 0; t < T; ++t) {
+    float num_state = 0.0f; // numerator state
+    float den_state = 0.0f; // denominator state
+    for (int t = 0; t < seq_len; ++t) {
         const int idx = offset + t * C;
         const float kt = static_cast<float>(k[idx]);
         const float vt = static_cast<float>(v[idx]);
         const float exp_kt = expf(kt);
         
-        a = a * decay + exp_kt * vt;
-        b = b * decay + exp_kt;
-        num_fwd[idx] = a;
-        den_fwd[idx] = b;
+        num_state = num_state * decay + exp_kt * vt;
+        den_state = den_state * decay + exp_kt;
+        num_fwd[idx] = num_state;
+        den_fwd[idx] = den_state;
     }
 
     // Backward RNN (right-to-left)
-    a = 0.0f;
-    b = 0.0f;
-    for (int t = T - 1; t >= 0; --t) {
+    num_state = 0.0f;
+    den_state = 0.0f;
+    for (int t = seq_len - 1; t >= 0; --t) {
         const int idx = offset + t * C;
         const float kt = static_cast<float>(k[idx]);
         const float vt = static_cast<float>(v[idx]);
         const float exp_kt = expf(kt);
 
-        a = a * decay + exp_kt * vt;
-        b = b * decay + exp_kt;
-        num_bwd[idx] = a;
-        den_bwd[idx] = b;
+        num_state = num_state * decay + exp_kt * vt;
+        den_state = den_state * decay + exp_kt;
+        num_bwd[idx] = num_state;
+        den_bwd[idx] = den_state;
     }
     
     // Final combination
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < seq_len; ++t) {
         const int idx = offset + t * C;
         const float kt = static_cast<float>(k[idx]);
         const float vt = static_cast<float>(v[idx]);
         const float rt = static_cast<float>(r[idx]);
         
-        // num = fwd_num + bwd_num + bonus
-        const float num = num_fwd[idx] + num_bwd[idx] - (expf(kt) * vt) + expf(u[c] + kt) * vt;
-        // den = fwd_den + bwd_den + bonus
-        const float den = den_fwd[idx] + den_bwd[idx] - expf(kt) + expf(u[c] + kt);
+        const float exp_kt = expf(kt);
+        const float bonus_num = expf(u[c] + kt) * vt;
+        const float bonus_den = expf(u[c] + kt);
+        
+        // num = fwd_num + bwd_num - current_contribution + bonus_contribution
+        const float num = num_fwd[idx] + num_bwd[idx] - (exp_kt * vt) + bonus_num;
+        // den = fwd_den + bwd_den - current_contribution + bonus_contribution
+        const float den = den_fwd[idx] + den_bwd[idx] - exp_kt + bonus_den;
         
         const float wkv = num / fmaxf(den, 1e-8f);
         const float sig_r = 1.0f / (1.0f + expf(-rt));
         
-        y[idx] = static_cast<T>(sig_r * wkv);
+        y[idx] = static_cast<T_in>(sig_r * wkv);
     }
 }
 
 
 // CUDA kernel for the backward pass of Bi-WKV (Full BPTT implementation)
-template<typename T>
+template<typename T_in>
 __global__ void bi_wkv_backward_kernel(
-    const T* r, const T* k, const T* v, const float* w, const float* u, const T* y,
-    const T* grad_y,
+    const T_in* r, const T_in* k, const T_in* v, const float* w, const float* u,
+    const T_in* grad_y,
     const float* num_fwd, const float* den_fwd, const float* num_bwd, const float* den_bwd,
-    T* grad_r, T* grad_k, T* grad_v, float* grad_w, float* grad_u,
-    const int B, const int T, const int C)
+    T_in* grad_r, T_in* grad_k, T_in* grad_v, float* grad_w, float* grad_u,
+    const int B, const int seq_len, const int C)
 {
     const int b = blockIdx.x;
     const int c = threadIdx.x + blockIdx.y * blockDim.x;
     if (c >= C) return;
 
-    const int offset = b * T * C + c;
+    const int offset = b * seq_len * C + c;
     
     const float decay = expf(-expf(w[c]));
     const float d_decay_d_w = -expf(w[c]) * decay;
@@ -98,62 +102,49 @@ __global__ void bi_wkv_backward_kernel(
     float grad_u_acc = 0.0f;
 
     // --- Pass 1: Backward in time (for forward states) ---
-    float ga_fwd = 0.0f; // gradient w.r.t. numerator state 'a'
-    float gb_fwd = 0.0f; // gradient w.r.t. denominator state 'b'
-    for (int t = T - 1; t >= 0; --t) {
+    float ga_fwd = 0.0f; // gradient w.r.t. numerator state
+    float gb_fwd = 0.0f; // gradient w.r.t. denominator state
+    for (int t = seq_len - 1; t >= 0; --t) {
         const int idx = offset + t * C;
         
-        // Reconstruct wkv and related terms
         const float kt = static_cast<float>(k[idx]);
         const float vt = static_cast<float>(v[idx]);
         const float rt = static_cast<float>(r[idx]);
         const float sig_r = 1.0f / (1.0f + expf(-rt));
-        
-        const float num = num_fwd[idx] + num_bwd[idx] - (expf(kt) * vt) + expf(u[c] + kt) * vt;
-        const float den = den_fwd[idx] + den_bwd[idx] - expf(kt) + expf(u[c] + kt);
+
+        const float exp_kt = expf(kt);
+        const float bonus_num = expf(u[c] + kt) * vt;
+        const float bonus_den = expf(u[c] + kt);
+        const float num = num_fwd[idx] + num_bwd[idx] - (exp_kt * vt) + bonus_num;
+        const float den = den_fwd[idx] + den_bwd[idx] - exp_kt + bonus_den;
         const float wkv = num / fmaxf(den, 1e-8f);
 
-        // Gradient of the loss w.r.t. wkv_t
         const float grad_wkv = static_cast<float>(grad_y[idx]) * sig_r;
-
-        // Gradients w.r.t. num_t and den_t using quotient rule
         const float grad_num = grad_wkv / den;
         const float grad_den = -grad_wkv * wkv / den;
 
-        // Propagated gradients from t+1
         const float ga_fwd_prop = ga_fwd * decay;
         const float gb_fwd_prop = gb_fwd * decay;
 
-        // Total gradient for the current states
         const float total_ga = grad_num + ga_fwd_prop;
         const float total_gb = grad_den + gb_fwd_prop;
         
-        // --- Calculate gradients for inputs at time t ---
-        const float exp_kt = expf(kt);
         const float exp_uk = expf(u[c] + kt);
         
-        // grad_r
-        grad_r[idx] = static_cast<T>(static_cast<float>(grad_y[idx]) * wkv * sig_r * (1.0f - sig_r));
-        
-        // grad_v
-        grad_v[idx] = static_cast<T>(total_ga * exp_kt + grad_num * (exp_uk - exp_kt));
-        
-        // grad_k
-        grad_k[idx] = static_cast<T>(
+        grad_r[idx] = static_cast<T_in>(static_cast<float>(grad_y[idx]) * wkv * sig_r * (1.0f - sig_r));
+        grad_v[idx] = static_cast<T_in>(total_ga * exp_kt + grad_num * (exp_uk - exp_kt));
+        grad_k[idx] = static_cast<T_in>(
             total_ga * exp_kt * vt + total_gb * exp_kt +
             grad_num * (exp_uk * vt - exp_kt * vt) +
             grad_den * (exp_uk - exp_kt)
         );
         
-        // Accumulate grad_u
         grad_u_acc += grad_num * exp_uk * vt + grad_den * exp_uk;
 
-        // Accumulate grad_w
         if (t > 0) {
-            grad_w_acc += (ga_fwd_prop * num_fwd[idx - C] / decay + gb_fwd_prop * den_fwd[idx - C] / decay) * d_decay_d_w;
+            grad_w_acc += (ga_fwd * num_fwd[idx - C] + gb_fwd * den_fwd[idx - C]) * d_decay_d_w;
         }
 
-        // Update gradient states for next iteration (t-1)
         ga_fwd = total_ga;
         gb_fwd = total_gb;
     }
@@ -161,16 +152,19 @@ __global__ void bi_wkv_backward_kernel(
     // --- Pass 2: Forward in time (for backward states) ---
     float ga_bwd = 0.0f;
     float gb_bwd = 0.0f;
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < seq_len; ++t) {
         const int idx = offset + t * C;
         
-        // Reconstruct wkv and related terms
         const float kt = static_cast<float>(k[idx]);
         const float vt = static_cast<float>(v[idx]);
-        const float sig_r = 1.0f / (1.0f + expf(-static_cast<float>(r[idx])));
-        
-        const float num = num_fwd[idx] + num_bwd[idx] - (expf(kt) * vt) + expf(u[c] + kt) * vt;
-        const float den = den_fwd[idx] + den_bwd[idx] - expf(kt) + expf(u[c] + kt);
+        const float rt = static_cast<float>(r[idx]);
+        const float sig_r = 1.0f / (1.0f + expf(-rt));
+
+        const float exp_kt = expf(kt);
+        const float bonus_num = expf(u[c] + kt) * vt;
+        const float bonus_den = expf(u[c] + kt);
+        const float num = num_fwd[idx] + num_bwd[idx] - (exp_kt * vt) + bonus_num;
+        const float den = den_fwd[idx] + den_bwd[idx] - exp_kt + bonus_den;
         const float wkv = num / fmaxf(den, 1e-8f);
 
         const float grad_wkv = static_cast<float>(grad_y[idx]) * sig_r;
@@ -183,14 +177,11 @@ __global__ void bi_wkv_backward_kernel(
         const float total_ga = grad_num + ga_bwd_prop;
         const float total_gb = grad_den + gb_bwd_prop;
         
-        const float exp_kt = expf(kt);
+        grad_v[idx] += static_cast<T_in>(total_ga * exp_kt);
+        grad_k[idx] += static_cast<T_in>(total_ga * exp_kt * vt + total_gb * exp_kt);
         
-        // Additive gradients from this pass
-        grad_v[idx] += static_cast<T>(total_ga * exp_kt);
-        grad_k[idx] += static_cast<T>(total_ga * exp_kt * vt + total_gb * exp_kt);
-        
-        if (t < T - 1) {
-            grad_w_acc += (ga_bwd_prop * num_bwd[idx + C] / decay + gb_bwd_prop * den_bwd[idx + C] / decay) * d_decay_d_w;
+        if (t < seq_len - 1) {
+            grad_w_acc += (ga_bwd * num_bwd[idx + C] + gb_bwd * den_bwd[idx + C]) * d_decay_d_w;
         }
 
         ga_bwd = total_ga;
@@ -215,7 +206,6 @@ void bi_wkv_forward(
     const int threads = 256;
     const dim3 blocks(B, (C + threads - 1) / threads);
 
-    // Split workspace for the 4 state tensors
     float* num_fwd = reinterpret_cast<float*>(workspace.data_ptr());
     float* den_fwd = num_fwd + B * T * C;
     float* num_bwd = den_fwd + B * T * C;
@@ -244,7 +234,6 @@ void bi_wkv_backward(
     const int threads = 256;
     const dim3 blocks(B, (C + threads - 1) / threads);
 
-    // Split workspace to retrieve state tensors
     const float* num_fwd = reinterpret_cast<const float*>(workspace.data_ptr());
     const float* den_fwd = num_fwd + B * T * C;
     const float* num_bwd = den_fwd + B * T * C;
@@ -253,7 +242,7 @@ void bi_wkv_backward(
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(r.scalar_type(), "bi_wkv_backward", ([&] {
         bi_wkv_backward_kernel<scalar_t><<<blocks, threads>>>(
             get_ptr<scalar_t>(r), get_ptr<scalar_t>(k), get_ptr<scalar_t>(v),
-            get_ptr<float>(w), get_ptr<float>(u), get_ptr<scalar_t>(y),
+            get_ptr<float>(w), get_ptr<float>(u),
             get_ptr<scalar_t>(grad_y),
             num_fwd, den_fwd, num_bwd, den_bwd,
             get_ptr<scalar_t>(grad_r), get_ptr<scalar_t>(grad_k), get_ptr<scalar_t>(grad_v),

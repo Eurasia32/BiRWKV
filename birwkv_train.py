@@ -30,6 +30,9 @@ from torch.utils.data import DataLoader
 from torch.utils.cpp_extension import load
 from transformers import AutoTokenizer, get_scheduler
 
+# --- 代理 ---
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 # --- 日志设置 ---
 logging.basicConfig(
     level=logging.INFO,
@@ -163,7 +166,7 @@ class BiRWKVBlock(nn.Module):
         self.ln2 = RMSLayerNorm(config.d_model)
         self.shift2 = BiShift(config)
         hidden_size = int(config.d_model * config.mlp_ratio)
-        self.ff_r_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.ff_r_proj = nn.Linear(config.d_model, hidden_size, bias=False)
         self.ff_k_proj = nn.Linear(config.d_model, hidden_size, bias=False)
         self.ff_v_proj = nn.Linear(hidden_size, config.d_model, bias=False)
 
