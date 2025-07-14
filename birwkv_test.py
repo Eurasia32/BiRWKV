@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 # --- 从训练脚本中导入模型定义 ---
 # 这样可以避免代码重复，并确保模型结构一致
 try:
-    from train_birwkv import BiRWKVConfig, BiRWKVModel
+    from train import BiRWKVConfig, BiRWKVModel
 except ImportError:
     print("错误: 无法从 'train_birwkv.py' 导入模型。请确保该文件在同一目录下。")
     exit(1)
@@ -136,7 +136,9 @@ def main(args):
     model = BiRWKVModel(config)
     
     try:
-        model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
+        checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        # model.load_state_dict(torch.load(args.checkpoint_path, map_location=device, weights_only = False))
     except FileNotFoundError:
         log.error(f"错误: 检查点文件未找到 at {args.checkpoint_path}")
         return
