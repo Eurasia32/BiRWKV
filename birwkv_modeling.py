@@ -22,7 +22,7 @@ from typing import (
     Dict,
     Any,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from enum import StrEnum
 
@@ -78,7 +78,7 @@ class ModelConfig:
     mlp_hidden_size: Optional[int] = None
     
     # Diffusion
-    diffusion: DiffusionConfig = DiffusionConfig()
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     
     # Layer norm and initialization
     layer_norm_type: str = "rms"
@@ -187,8 +187,9 @@ class DiffusionScheduler:
         
     def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Add noise to samples according to the noise schedule."""
-        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps].to(original_samples.device)
-        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(original_samples.device)
+        device = original_samples.device
+        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps].to(device)
+        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(device)
         
         # Reshape for broadcasting
         while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
@@ -200,8 +201,9 @@ class DiffusionScheduler:
         
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Get velocity for v-prediction parameterization."""
-        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps].to(sample.device)
-        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(sample.device)
+        device = sample.device
+        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps].to(device)
+        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(device)
         
         while len(sqrt_alpha_prod.shape) < len(sample.shape):
             sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
@@ -321,7 +323,7 @@ class BiShiftLLADA(nn.Module):
                 shift_part = x_center[:, :, start_idx:end_idx]
                 
             # Apply time-conditioned pattern
-            pattern = self.shift_patterns[i, start_idx:end_idx].unsqueeze(0).unsqueeze(0)
+            pattern = self.shift_patterns[i, start_idx:end_idx].unsqueeze(0).unsqueeze(0).to(x.device)
             shift_part = shift_part + time_shift[:, :, start_idx:end_idx] * pattern
             
             x_shifted_parts.append(shift_part)
@@ -867,6 +869,9 @@ class BiRWKVLLADAModel(nn.Module):
         # Handle timesteps for diffusion
         if timesteps is None:
             timesteps = torch.zeros(batch_size, dtype=torch.long, device=input_ids.device)
+        else:
+            # Ensure timesteps are on the same device as input_ids
+            timesteps = timesteps.to(input_ids.device)
         
         # Time embedding
         time_emb = self.time_embedding(timesteps)  # [B, time_dim]
@@ -1021,6 +1026,9 @@ class BiRWKVLLADAModel(nn.Module):
             timesteps = torch.randint(
                 0, self.scheduler.num_train_timesteps, (batch_size,), device=device
             )
+        else:
+            # Ensure timesteps are on the correct device
+            timesteps = timesteps.to(device)
         
         # Get clean embeddings
         clean_embeddings = self.transformer.wte(input_ids)
@@ -1028,6 +1036,9 @@ class BiRWKVLLADAModel(nn.Module):
         # Sample noise
         if noise is None:
             noise = torch.randn_like(clean_embeddings)
+        else:
+            # Ensure noise is on the correct device
+            noise = noise.to(device)
         
         # Add noise according to schedule
         noisy_embeddings = self.scheduler.add_noise(clean_embeddings, noise, timesteps)
@@ -1149,11 +1160,8 @@ class BiRWKVLLADAModel(nn.Module):
             if i < len(timesteps) - 1:
                 # Not the last step
                 prev_timestep = timesteps[i + 1]
-                alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                alpha_prod_t_prev = self.scheduler.alphas_cumprod[prev_timestep]
-                
-                alpha_prod_t = alpha_prod_t.to(device)
-                alpha_prod_t_prev = alpha_prod_t_prev.to(device)
+                alpha_prod_t = self.scheduler.alphas_cumprod[t].to(device)
+                alpha_prod_t_prev = self.scheduler.alphas_cumprod[prev_timestep].to(device)
                 
                 beta_prod_t = 1 - alpha_prod_t
                 
