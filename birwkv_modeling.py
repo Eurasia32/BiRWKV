@@ -32,8 +32,8 @@ try:
     birwkv_cuda = load(
         name="birwkv",
         sources=[
-            os.path.join(module_path, "birwkv_op.cpp"),
-            os.path.join(module_path, "birwkv_kernel.cu"),
+            os.path.join(module_path, "cuda/rwkv8/birwkv_op.cpp"),
+            os.path.join(module_path, "cuda/rwkv8/birwkv_kernel.cu"),
         ],
         verbose=False, # Set to True for compilation details
     )
