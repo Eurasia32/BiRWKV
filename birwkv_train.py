@@ -65,7 +65,7 @@ class BiRWKVConfig:
     """Configuration for the BiRWKV model."""
     vocab_size: int = 50257
     d_model: int = 1024
-    n_layers: int = 32
+    n_layers: int = 24
     mlp_ratio: float = 2.5
     block_type: str = "birwkv"
     
