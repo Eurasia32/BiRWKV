@@ -269,7 +269,11 @@ def main(args):
     if completed_steps > 0:
         log.info(f"快进数据加载器 {completed_steps} 步...")
         for _ in tqdm(range(completed_steps), desc="快进数据"):
-            next(train_iterator)
+            try:
+                next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_dataloader)
+                next(train_iterator)
 
     model.train()
     progress_bar = tqdm(range(completed_steps, args.max_steps), desc="训练进度")
