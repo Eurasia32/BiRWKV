@@ -4,20 +4,22 @@
 # Enhanced training script for BiRWKV-LLADA diffusion language model.
 # This version supports diffusion training with time conditioning, noise scheduling,
 # and multiple prediction parameterizations. Supports resuming training from checkpoints.
-# Now with DeepSpeed integration for distributed training.
 #
 # 运行要求:
-# 1. 安装 PyTorch, transformers, datasets, sentencepiece, ninja, deepspeed
-#    pip install torch transformers datasets sentencepiece ninja deepspeed
+# 1. 安装 PyTorch, transformers, datasets, sentencepiece, ninja
+#    pip install torch transformers datasets sentencepiece ninja
 # 2. 将 birwkv_op.cpp 和 birwkv_kernel.cu 文件放置在同一目录下。
 # 3. 确保您的环境已安装NVIDIA CUDA Toolkit和C++编译器(如g++)。
 #
-# 运行命令示例 (使用 DeepSpeed 从零开始):
-# deepspeed birwkv_train.py --deepspeed --deepspeed_config ds_config.json --batch_size 8 --learning_rate 3e-4 --max_steps 50000 --diffusion_steps 1000
+# 运行命令示例 (扩散训练从零开始):
+# python birwkv_train.py --batch_size 8 --learning_rate 3e-4 --max_steps 50000 --diffusion_steps 1000
 #
-# 运行命令示例 (从 DeepSpeed 检查点恢复):
-# deepspeed birwkv_train.py --deepspeed --deepspeed_config ds_config.json --resume_from_checkpoint ./birwkv-llada-model/checkpoint-10000
+# 运行命令示例 (从检查点恢复):
+# python birwkv_train.py --resume_from_checkpoint ./birwkv-llada-model/checkpoint-10000
 #
+# 运行命令示例 (v-prediction参数化):
+# python birwkv_train.py --prediction_type v_prediction --beta_schedule cosine --token_loss_weight 0.1
+#n
 
 import argparse
 import logging
@@ -34,8 +36,6 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_scheduler
 from tqdm import tqdm
 import numpy as np
-import deepspeed
-from deepspeed.ops.adam import DeepSpeedCPUAdam
 
 # Import our enhanced BiRWKV-LLADA model
 try:
@@ -167,11 +167,9 @@ class TrainingConfig:
 
 
 # --- Training Loop ---
-def train_step(model_engine, batch, config):
-    """Single training step with diffusion loss using DeepSpeed."""
-    # DeepSpeed handles moving data to the correct device.
-    # No need for: batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-    
+def train_step(model, batch, config, device):
+    """Single training step with diffusion loss."""
+    batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
     training_mode = batch.get("training_mode", ["diffusion"] * len(batch["input_ids"]))
     
     input_ids = batch["input_ids"]
@@ -189,8 +187,7 @@ def train_step(model_engine, batch, config):
     
     if use_diffusion:
         # Diffusion training
-        # Note: model_engine is the deepspeed-wrapped model
-        losses = model_engine.module.compute_diffusion_loss(
+        losses = model.compute_diffusion_loss(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
@@ -207,7 +204,7 @@ def train_step(model_engine, batch, config):
     
     else:
         # Traditional token prediction training
-        output = model_engine(
+        output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
@@ -227,13 +224,9 @@ def train_step(model_engine, batch, config):
 
 # --- Main Training Function ---
 def main(args):
-    # DeepSpeed Initialization
-    deepspeed.init_distributed()
-    
     # Device setup
-    device = torch.device(f"cuda:{args.local_rank}")
-    torch.cuda.set_device(device)
-    log.info(f"使用设备: {device} (DeepSpeed local_rank: {args.local_rank})")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"使用设备: {device}")
     
     if BIWKV_LLADA_CUDA_AVAILABLE:
         log.info("BiRWKV-LLADA CUDA 核函数已加载")
@@ -270,54 +263,47 @@ def main(args):
     # Model setup
     model_config = config.to_model_config(vocab_size=len(tokenizer))
     model = BiRWKVLLADAModel(model_config)
+    model.to(device)
     
-    # Count parameters - do this before wrapping with DeepSpeed
-    if args.local_rank == 0:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        log.info(f"总参数量: {total_params / 1e6:.2f}M, 可训练参数: {trainable_params / 1e6:.2f}M")
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"总参数量: {total_params / 1e6:.2f}M, 可训练参数: {trainable_params / 1e6:.2f}M")
     
-    # Optimizer
-    optimizer = DeepSpeedCPUAdam(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
+    # Optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.learning_rate, 
+        weight_decay=config.weight_decay, 
         betas=(0.9, 0.95)
     )
     
-    # DeepSpeed model engine
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        optimizer=optimizer
+    lr_scheduler = get_scheduler(
+        name="linear", 
+        optimizer=optimizer, 
+        num_warmup_steps=config.warmup_steps, 
+        num_training_steps=config.max_steps
     )
-    
-    # Scheduler
-    # lr_scheduler = get_scheduler(
-    #     name="linear", 
-    #     optimizer=optimizer, 
-    #     num_warmup_steps=config.warmup_steps, 
-    #     num_training_steps=config.max_steps
-    # )
     
     completed_steps = 0
     
     # Load checkpoint if specified
     if config.resume_from_checkpoint:
-        # DeepSpeed handles loading the model, optimizer, and scheduler states
-        _, client_state = model_engine.load_checkpoint(config.resume_from_checkpoint)
-        if client_state:
-            completed_steps = client_state.get('completed_steps', 0)
-            #lr_scheduler.load_state_dict(client_state['scheduler_state_dict'])
-            log.info(f"从检查点恢复训练: {config.resume_from_checkpoint}, 已恢复至步骤 {completed_steps}")
+        checkpoint_path = os.path.join(config.resume_from_checkpoint, "checkpoint.pt")
+        if os.path.exists(checkpoint_path):
+            log.info(f"从检查点恢复训练: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            completed_steps = checkpoint['completed_steps']
+            log.info(f"已恢复至步骤 {completed_steps}")
         else:
-            log.warning(f"检查点未找到或加载失败: {config.resume_from_checkpoint}。将从零开始训练。")
-
+            log.warning(f"检查点未找到: {checkpoint_path}。将从零开始训练。")
     
     # Dataset setup
     log.info("加载和预处理数据集...")
     raw_datasets = load_dataset("wikitext", "wikitext-103-v1", streaming=True)
-    # For streaming datasets, sharding is handled automatically in distributed training
     train_dataset = raw_datasets["train"]
     
     data_collator = BiRWKVLLADADataCollator(
@@ -326,16 +312,15 @@ def main(args):
         diffusion_mode=config.diffusion_mode
     )
     
-    # Use model_engine.train_batch_size() which is adjusted for gradient accumulation
     train_dataloader = DataLoader(
         train_dataset.with_format("torch"), 
         collate_fn=data_collator, 
-        batch_size=model_engine.train_batch_size()
+        batch_size=config.batch_size
     )
     train_iterator = iter(train_dataloader)
     
     # Fast-forward data loader if resuming
-    if completed_steps > 0 and args.local_rank == 0:
+    if completed_steps > 0:
         log.info(f"快进数据加载器 {completed_steps} 步...")
         for _ in tqdm(range(completed_steps), desc="快进数据"):
             try:
@@ -345,8 +330,8 @@ def main(args):
                 next(train_iterator)
     
     # Training loop
-    model_engine.train()
-    progress_bar = tqdm(range(completed_steps, config.max_steps), desc="BiRWKV-LLADA 训练进度", disable=(args.local_rank != 0))
+    model.train()
+    progress_bar = tqdm(range(completed_steps, config.max_steps), desc="BiRWKV-LLADA 训练进度")
     
     # Running averages for logging
     running_losses = {}
@@ -358,76 +343,72 @@ def main(args):
         except StopIteration:
             train_iterator = iter(train_dataloader)
             batch = next(train_iterator)
-
-        # Move batch to device
-        batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
         
-        # The autocast context manager is handled by DeepSpeed's fp16/bf16 config
-        loss, loss_dict = train_step(model_engine, batch, config)
+        # Mixed precision training
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type=="cuda"):
+            loss, loss_dict = train_step(model, batch, config, device)
         
         # Check for NaN
         if torch.isnan(loss):
             log.error("损失值为NaN，跳过此步骤。")
             continue
         
-        # Backward pass using DeepSpeed
-        model_engine.backward(loss)
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
         
-        # Optimizer and scheduler step using DeepSpeed
-        model_engine.step()
+        # Update running averages
+        for key, value in loss_dict.items():
+            if key not in running_losses:
+                running_losses[key] = value
+            else:
+                running_losses[key] = 0.9 * running_losses[key] + 0.1 * value
         
-        # Update running averages (only on rank 0 to avoid clutter)
-        if args.local_rank == 0:
-            for key, value in loss_dict.items():
-                if key not in running_losses:
-                    running_losses[key] = value
-                else:
-                    running_losses[key] = 0.9 * running_losses[key] + 0.1 * value
-        
-        # Update progress bar (only on rank 0)
+        # Update progress
         progress_bar.update(1)
         
-        if args.local_rank == 0:
-            log_dict = {
-                "lr": f"{model_engine.get_lr()[0]:.6f}",
-                "total": f"{running_losses.get('total_loss', 0):.4f}"
-            }
-            if "diffusion_loss" in running_losses:
-                log_dict["diff"] = f"{running_losses['diffusion_loss']:.4f}"
-            if "token_loss" in running_losses:
-                log_dict["token"] = f"{running_losses['token_loss']:.4f}"
-                
-            progress_bar.set_postfix(log_dict)
-
+        # Log current losses
+        log_dict = {
+            "lr": f"{lr_scheduler.get_last_lr()[0]:.6f}",
+            "total": f"{running_losses.get('total_loss', 0):.4f}"
+        }
+        if "diffusion_loss" in running_losses:
+            log_dict["diff"] = f"{running_losses['diffusion_loss']:.4f}"
+        if "token_loss" in running_losses:
+            log_dict["token"] = f"{running_losses['token_loss']:.4f}"
+            
+        progress_bar.set_postfix(log_dict)
         completed_steps += 1
         
-        # Detailed logging (only on rank 0)
-        if completed_steps % log_interval == 0 and args.local_rank == 0:
+        # Detailed logging
+        if completed_steps % log_interval == 0:
             log_msg = f"Step {completed_steps}: "
             for key, value in running_losses.items():
                 log_msg += f"{key}={value:.4f} "
-            log_msg += f"lr={model_engine.get_lr()[0]:.6f}"
+            log_msg += f"lr={lr_scheduler.get_last_lr()[0]:.6f}"
             log.info(log_msg)
         
-        # Save checkpoint using DeepSpeed
+        # Save checkpoint
         if completed_steps % config.save_interval == 0:
-            checkpoint_dir = os.path.join(config.output_dir, f"checkpoint-{completed_steps}")
+            save_path = os.path.join(config.output_dir, f"checkpoint-{completed_steps}")
+            os.makedirs(save_path, exist_ok=True)
             
-            # Additional state to save
-            client_state = {
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': lr_scheduler.state_dict(),
                 'completed_steps': completed_steps,
+                'config': config,
                 'running_losses': running_losses,
-                # 'scheduler_state_dict': lr_scheduler.state_dict(),
-                'config': config
             }
             
-            # DeepSpeed handles saving the model/optimizer/etc. state
-            model_engine.save_checkpoint(checkpoint_dir, client_state=client_state)
-            if args.local_rank == 0:
-                log.info(f"DeepSpeed 检查点已保存至 {checkpoint_dir}")
+            torch.save(checkpoint, os.path.join(save_path, "checkpoint.pt"))
+            log.info(f"检查点已保存至 {save_path}")
     
-    if args.local_rank == 0:
-        log.info("BiRWKV-LLADA 训练完成！")
+    log.info("BiRWKV-LLADA 训练完成！")
 
 
 if __name__ == "__main__":
@@ -447,7 +428,7 @@ if __name__ == "__main__":
     
     # Training parameters
     parser.add_argument("--seq_len", type=int, default=512, help="输入序列长度")
-    parser.add_argument("--batch_size", type=int, default=4, help="每个GPU的训练批次大小")
+    parser.add_argument("--batch_size", type=int, default=4, help="训练批次大小")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="权重衰减")
     parser.add_argument("--max_steps", type=int, default=100000, help="总训练步数")
@@ -463,9 +444,5 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./birwkv-llada-model", help="模型输出目录")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="检查点恢复路径")
     
-    # DeepSpeed arguments
-    parser.add_argument("--local_rank", type=int, default=-1, help="DeepSpeed-injected local rank")
-    parser = deepspeed.add_config_arguments(parser)
-
     args = parser.parse_args()
     main(args)

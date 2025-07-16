@@ -1,0 +1,2 @@
+./.conda/bin/python birwkv_train_solo.py --batch_size 32 --learning_rate 3e-4 --max_steps 50000 --diffusion_steps 1000
+deepspeed --num_gpus=4 birwkv_train.py --deepspeed --deepspeed_config ds_config.json --batch_size 4 --learning_rate 3e-4 --max_steps 50000 --diffusion_steps 1000
