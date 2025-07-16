@@ -875,7 +875,8 @@ class BiRWKVLLADAModel(nn.Module):
         
         # Time embedding
         time_emb = self.time_embedding(timesteps)  # [B, time_dim]
-        time_emb = self.time_mlp(time_emb)  # [B, time_dim]
+        with torch.autocast(enabled=False, device_type="cuda"):
+            time_emb = self.time_mlp(time_emb)  # [B, time_dim]
         
         if past_key_values is None:
             past_length = 0
@@ -1692,7 +1693,7 @@ class BiRWKVLLADABlock(nn.Module):
         
         # MLP with time conditioning
         hidden_size = config.mlp_hidden_size if hasattr(config, 'mlp_hidden_size') and config.mlp_hidden_size is not None else int(config.mlp_ratio * config.d_model)
-        self.ff_r_proj = TimeConditionedLinear(config.d_model, config.d_model, time_dim, bias=False)
+        self.ff_r_proj = TimeConditionedLinear(config.d_model, hidden_size, time_dim, bias=False)
         self.ff_k_proj = TimeConditionedLinear(config.d_model, hidden_size, time_dim, bias=False)
         self.ff_v_proj = TimeConditionedLinear(hidden_size, config.d_model, time_dim, bias=False)
         
