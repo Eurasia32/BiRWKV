@@ -249,10 +249,16 @@ def main(args):
             log.info(f"从检查点恢复训练: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            completed_steps = checkpoint['completed_steps']
-            log.info(f"已恢复至步骤 {completed_steps}")
+            if args.reset_state_on_resume:
+                log.info("重置优化器、调度器和步数，开始新的训练阶段。")
+                completed_steps = 0
+            else:
+                log.info("从检查点恢复优化器、调度器和步数。")
+                if 'optimizer_state_dict' in checkpoint: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint: lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'scaler_state_dict' in checkpoint: scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                if 'completed_steps' in checkpoint: completed_steps = checkpoint['completed_steps']
+                log.info(f"已恢复至步骤 {completed_steps}")
         else:
             log.warning(f"检查点未找到: {checkpoint_path}。将从零开始训练。")
 
@@ -266,7 +272,7 @@ def main(args):
     train_iterator = iter(train_dataloader)
 
     # --- 新增: 快进数据加载器 ---
-    if completed_steps > 0:
+    if completed_steps > 0 and not args.reset_state_on_resume:
         log.info(f"快进数据加载器 {completed_steps} 步...")
         for _ in tqdm(range(completed_steps), desc="快进数据"):
             try:
@@ -334,5 +340,6 @@ if __name__ == "__main__":
     # --- 新增: 恢复训练的参数 ---
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="要从中恢复训练的检查点目录路径。")
     
+    parser.add_argument("--reset_state_on_resume", action="store_true", help="当从检查点恢复时，重置优化器、调度器和步数。用于在新的数据集上进行微调或持续训练。")
     args = parser.parse_args()
     main(args)
